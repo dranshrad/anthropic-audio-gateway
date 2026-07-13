@@ -6,6 +6,8 @@ AGPL-3.0 real-time AI audio runtime: browser (or WebRTC-bridged) PCM/Opus → pr
 
 > Anthropic’s public Messages API is HTTP/SSE today. Realtime-style WSS URLs are configurable per provider. Use `PROVIDER=mock` for local/CI work without cloud credentials.
 
+> **Security — open relay:** If `AUTH_JWT_SECRET` is unset, **any client that can reach the WebSocket can drive your configured provider with your server-side API key**. Treat unbound deployments as an open relay. Set `AUTH_JWT_SECRET` (and preferably `AUTH_ALLOWED_ORIGINS`) before exposing the port beyond localhost. For production, set `AUTH_REQUIRED=true` so the process refuses to boot without a secret.
+
 ## Architecture
 
 ```mermaid
@@ -57,10 +59,15 @@ curl -s http://127.0.0.1:8080/health
 curl -s http://127.0.0.1:8080/metrics | head
 ```
 
+Open [`examples/demo-client.html`](examples/demo-client.html) against `ws://127.0.0.1:8080`. Live-provider checklist: [`docs/SMOKE_REAL_PROVIDER.md`](docs/SMOKE_REAL_PROVIDER.md).
+
 ```bash
-npm run bench          # mock load harness
+npm test                 # unit + mock WS integration (also run in CI)
+npm run bench            # local mock load harness
 npm run typecheck && npm run check && npm run build
 ```
+
+CI runs **check + typecheck + test + build** on Node 20/22 (bench is local-only).
 
 ## Providers
 
@@ -95,6 +102,12 @@ When provider `bufferedAmount` or the outbound Transform exceeds `HIGH_WATER_MAR
 ## Auth (v1)
 
 Optional HS256 JWT (`AUTH_JWT_SECRET`) via `?token=` or `Authorization: Bearer`. Optional `AUTH_ALLOWED_ORIGINS`, per-subject rate limit and session quotas.
+
+**Unset `AUTH_JWT_SECRET` = open relay** to your provider API key for anyone who can open a WebSocket. The process prints an OPEN RELAY WARNING on boot. Set `AUTH_REQUIRED=true` in production so boot fails closed without a secret.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). PRs should pass `npm run check && npm run typecheck && npm test && npm run build`.
 
 ## WebRTC ingress
 

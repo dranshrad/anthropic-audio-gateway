@@ -70,6 +70,10 @@ const envSchema = z
 		RATE_LIMIT_MAX_DELAY_MS: z.coerce.number().int().positive().default(30_000),
 
 		AUTH_JWT_SECRET: z.string().optional().default(""),
+		AUTH_REQUIRED: z
+			.enum(["true", "false"])
+			.default("false")
+			.transform((v) => v === "true"),
 		AUTH_ALLOWED_ORIGINS: z
 			.string()
 			.optional()
@@ -96,6 +100,14 @@ const envSchema = z
 				code: z.ZodIssueCode.custom,
 				path: ["HIGH_WATER_MARK"],
 				message: "must be less than or equal to MAX_BUFFERED_BYTES",
+			});
+		}
+		if (data.AUTH_REQUIRED && !data.AUTH_JWT_SECRET) {
+			ctx.addIssue({
+				code: z.ZodIssueCode.custom,
+				path: ["AUTH_JWT_SECRET"],
+				message:
+					"AUTH_REQUIRED=true but AUTH_JWT_SECRET is empty — refusing to bind an open relay.",
 			});
 		}
 		if (data.PROVIDER === "anthropic") {
@@ -148,6 +160,25 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 		throw new Error(`Invalid Environment Configuration\n${details}`);
 	}
 	return result.data;
+}
+
+/**
+ * Loud stderr warning when the gateway would accept unauthenticated clients.
+ */
+export function warnOpenRelay(cfg: Config): void {
+	if (cfg.AUTH_JWT_SECRET) {
+		return;
+	}
+	console.error(`
+╔══════════════════════════════════════════════════════════════════╗
+║  OPEN RELAY WARNING                                              ║
+║  AUTH_JWT_SECRET is unset. Any client that can reach this        ║
+║  WebSocket can drive your configured provider using the          ║
+║  server-side API key. Do not expose this port beyond localhost   ║
+║  without auth. Set AUTH_JWT_SECRET (and AUTH_ALLOWED_ORIGINS).   ║
+║  For production, set AUTH_REQUIRED=true to fail closed.          ║
+╚══════════════════════════════════════════════════════════════════╝
+`);
 }
 
 function bootConfig(): Config {

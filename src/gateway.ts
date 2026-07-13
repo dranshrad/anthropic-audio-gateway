@@ -2,6 +2,7 @@ import { Transform, type TransformCallback } from "node:stream";
 import type WebSocket from "ws";
 import { AdaptiveStreamingController } from "./adaptive/controller.js";
 import { AudioProcessor } from "./audio-processor.js";
+import { shouldPause } from "./backpressure.js";
 import type { Config } from "./config.js";
 import {
 	bufferOccupancyGauge,
@@ -502,12 +503,14 @@ export class GatewaySession {
 	}
 
 	private isBackpressured(): boolean {
-		const upstream = this.providerBuffered();
-		return (
-			upstream >= this.highWaterMark ||
-			this.bufferedBytes + upstream >= this.config.MAX_BUFFERED_BYTES ||
-			this.outbound.writableLength >= this.outbound.writableHighWaterMark
-		);
+		return shouldPause({
+			upstreamBuffered: this.providerBuffered(),
+			pendingBytes: this.bufferedBytes,
+			queueDepth: this.outbound.writableLength,
+			highWaterMark: this.highWaterMark,
+			maxBuffered: this.config.MAX_BUFFERED_BYTES,
+			transformHwm: this.outbound.writableHighWaterMark,
+		});
 	}
 
 	private evaluateBackpressure(_reason: string): void {

@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    name: Typecheck, lint, and build
+    name: Lint, test, and build
     runs-on: ubuntu-latest
 
     strategy:
@@ -33,6 +33,11 @@ jobs:
 
       - name: Typecheck
         run: npm run typecheck
+
+      - name: Test
+        run: npm test
+        env:
+          PROVIDER: mock
 
       - name: Build
         run: npm run build

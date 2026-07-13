@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Audio Gateway Demo</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --fg: #e7ecf1;
+      --muted: #8b9aab;
+      --accent: #3d9cfd;
+      --danger: #f07178;
+      --ok: #7fd962;
+      --panel: #1a2332;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1b2a40, var(--bg));
+      color: var(--fg);
+      min-height: 100vh;
+      padding: 2rem;
+    }
+    h1 { font-weight: 600; letter-spacing: -0.02em; margin: 0 0 0.25rem; }
+    .sub { color: var(--muted); margin-bottom: 1.5rem; }
+    .row { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; margin-bottom: 1rem; }
+    input, button {
+      font: inherit;
+      border-radius: 8px;
+      border: 1px solid #2c3b50;
+      background: var(--panel);
+      color: var(--fg);
+      padding: 0.55rem 0.85rem;
+    }
+    input { min-width: 280px; flex: 1; }
+    button { cursor: pointer; background: var(--accent); border-color: transparent; color: #061018; font-weight: 600; }
+    button.secondary { background: transparent; color: var(--fg); border-color: #2c3b50; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #status { font-family: ui-monospace, monospace; font-size: 0.9rem; }
+    #status.ok { color: var(--ok); }
+    #status.err { color: var(--danger); }
+    #log {
+      background: var(--panel);
+      border: 1px solid #2c3b50;
+      border-radius: 12px;
+      padding: 1rem;
+      height: 360px;
+      overflow: auto;
+      font-family: ui-monospace, Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    .warn {
+      border: 1px solid #6b4a1e;
+      background: #2a2114;
+      color: #f0c674;
+      padding: 0.75rem 1rem;
+      border-radius: 10px;
+      margin-bottom: 1.25rem;
+      max-width: 52rem;
+    }
+  </style>
+</head>
+<body>
+  <h1>Audio Gateway Demo</h1>
+  <p class="sub">Works with <code>PROVIDER=mock</code> locally. For a real provider, see <code>docs/SMOKE_REAL_PROVIDER.md</code>.</p>
+  <div class="warn">
+    If the server has no <code>AUTH_JWT_SECRET</code>, this page can drive your server-side API key.
+    Use localhost + mock for demos; enable JWT before exposing the gateway.
+  </div>
+  <div class="row">
+    <input id="url" value="ws://127.0.0.1:8080" />
+    <button id="connect">Connect</button>
+    <button id="disconnect" class="secondary" disabled>Disconnect</button>
+    <button id="tone" class="secondary" disabled>Send tone burst</button>
+  </div>
+  <div class="row"><span id="status">Disconnected</span></div>
+  <div id="log"></div>
+  <script>
+    const logEl = document.getElementById("log");
+    const statusEl = document.getElementById("status");
+    const connectBtn = document.getElementById("connect");
+    const disconnectBtn = document.getElementById("disconnect");
+    const toneBtn = document.getElementById("tone");
+    let ws = null;
+
+    function log(line) {
+      const ts = new Date().toISOString().slice(11, 23);
+      logEl.textContent += `[${ts}] ${line}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function setConnected(on) {
+      connectBtn.disabled = on;
+      disconnectBtn.disabled = !on;
+      toneBtn.disabled = !on;
+      statusEl.className = on ? "ok" : "";
+    }
+
+    function tonePcm(ms = 200, sampleRate = 24000) {
+      const n = Math.floor((sampleRate * ms) / 1000);
+      const buf = new ArrayBuffer(n * 2);
+      const view = new DataView(buf);
+      for (let i = 0; i < n; i++) {
+        const sample = Math.floor(Math.sin((2 * Math.PI * 440 * i) / sampleRate) * 10000);
+        view.setInt16(i * 2, sample, true);
+      }
+      return buf;
+    }
+
+    connectBtn.onclick = () => {
+      const url = document.getElementById("url").value.trim();
+      ws = new WebSocket(url);
+      ws.binaryType = "arraybuffer";
+      statusEl.textContent = "Connecting…";
+      ws.onopen = () => {
+        setConnected(true);
+        statusEl.textContent = "Connected — waiting for gateway.ready";
+        log("socket open");
+      };
+      ws.onmessage = (ev) => {
+        if (typeof ev.data === "string") {
+          log(ev.data);
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === "gateway.ready") {
+              statusEl.textContent = `Ready (provider=${msg.provider || "?"})`;
+              statusEl.className = "ok";
+            }
+            if (msg.type === "gateway.pause") {
+              statusEl.textContent = `Paused: ${msg.reason || "backpressure"}`;
+            }
+            if (msg.type === "gateway.resume") {
+              statusEl.textContent = "Resumed";
+              statusEl.className = "ok";
+            }
+          } catch {}
+        } else {
+          log(`binary ${ev.data.byteLength} bytes`);
+        }
+      };
+      ws.onclose = () => {
+        setConnected(false);
+        statusEl.textContent = "Disconnected";
+        statusEl.className = "";
+        log("socket closed");
+      };
+      ws.onerror = () => {
+        statusEl.textContent = "Socket error";
+        statusEl.className = "err";
+      };
+    };
+
+    disconnectBtn.onclick = () => ws && ws.close();
+    toneBtn.onclick = () => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      for (let i = 0; i < 5; i++) ws.send(tonePcm(40));
+      log("sent 5 × 40ms tone frames");
+    };
+  </script>
+</body>
+</html>
