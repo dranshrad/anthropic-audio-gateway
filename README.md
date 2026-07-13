@@ -8,6 +8,12 @@ AGPL-3.0 real-time AI audio runtime: browser (or WebRTC-bridged) PCM/Opus → pr
 
 > **Security — open relay:** If `AUTH_JWT_SECRET` is unset, **any client that can reach the WebSocket can drive your configured provider with your server-side API key**. Treat unbound deployments as an open relay. Set `AUTH_JWT_SECRET` (and preferably `AUTH_ALLOWED_ORIGINS`) before exposing the port beyond localhost. For production, set `AUTH_REQUIRED=true` so the process refuses to boot without a secret.
 
+## Demo
+
+![Demo client connected to mock provider](docs/demo/demo-client.svg)
+
+Open [`examples/demo-client.html`](examples/demo-client.html) against a local gateway with `PROVIDER=mock`. Details: [docs/demo/README.md](docs/demo/README.md).
+
 ## Architecture
 
 ```mermaid
@@ -138,7 +144,17 @@ See [`.env.example`](.env.example). Boot fails before port bind if the active pr
 
 ## AGPL-3.0
 
-If you modify this and offer it as a network service, you must provide corresponding source to users under AGPL-3.0. See [LICENSE](LICENSE).
+If you modify this and offer it as a network service, you must provide corresponding source to users under AGPL-3.0. See [LICENSE](LICENSE). That is a deliberate copyleft choice for this suite — not an unexamined default.
+
+## Related projects
+
+| Project | Role |
+|---|---|
+| [codex-ast-mapper](https://github.com/dranshrad/codex-ast-mapper) | Compress repositories into token-budgeted LLM context |
+| [llm-cst-refactorer](https://github.com/dranshrad/llm-cst-refactorer) | Format-preserving typing & docstring refactors |
+| [automated-self-correction-loop](https://github.com/dranshrad/automated-self-correction-loop) (ASCL) | Execute → diagnose → heal loop |
+| [voice-notes-to-anthropic-artifacts](https://github.com/dranshrad/voice-notes-to-anthropic-artifacts) | Local STT → Anthropic → `~/Artifacts` |
+| [anthropic-audio-gateway](https://github.com/dranshrad/anthropic-audio-gateway) | Browser audio ↔ realtime provider adapters |
 
 ## Disclaimer
 

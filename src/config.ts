@@ -33,7 +33,7 @@ const envSchema = z
 			.refine((value) => value.startsWith("ws://") || value.startsWith("wss://"), {
 				message: "ANTHROPIC_REALTIME_WSS_URL must be a ws:// or wss:// URL",
 			}),
-		ANTHROPIC_MODEL: z.string().min(1).default("claude-sonnet-4-20250514"),
+		ANTHROPIC_MODEL: z.string().min(1).default("claude-sonnet-5"),
 		ANTHROPIC_API_VERSION: z.string().min(1).default("2023-06-01"),
 
 		OPENAI_API_KEY: z.string().optional().default(""),
