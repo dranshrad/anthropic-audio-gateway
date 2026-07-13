@@ -1,6 +1,6 @@
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import { type WebSocket, WebSocketServer } from "ws";
-import { type Config, type LogLevel, getConfig } from "./config.js";
+import { type Config, type LogLevel, config } from "./config.js";
 import { GatewaySession } from "./gateway.js";
 
 const LOG_LEVEL_ORDER: Record<LogLevel, number> = {
@@ -40,7 +40,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 function handleHttpRequest(
 	req: IncomingMessage,
 	res: ServerResponse,
-	config: Config,
+	cfg: Config,
 	activeSessions: number,
 ): void {
 	const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -50,8 +50,9 @@ function handleHttpRequest(
 			status: "ok",
 			uptimeSeconds: Math.floor(process.uptime()),
 			activeSessions,
-			audioFormat: config.AUDIO_FORMAT,
-			sampleRate: config.SAMPLE_RATE,
+			audioFormat: cfg.AUDIO_FORMAT,
+			sampleRate: cfg.SAMPLE_RATE,
+			nodeEnv: cfg.NODE_ENV,
 		});
 		return;
 	}
@@ -71,7 +72,7 @@ function handleHttpRequest(
 }
 
 async function main(): Promise<void> {
-	const config = getConfig();
+	// `config` is validated at module load — if we reached here, env is sane.
 	const log = createLogger(config.LOG_LEVEL);
 	const sessions = new Map<string, GatewaySession>();
 
@@ -127,7 +128,8 @@ async function main(): Promise<void> {
 	log(
 		"info",
 		`Anthropic Live-Audio Stream Gateway listening on ws://${config.HOST}:${config.PORT} ` +
-			`(format=${config.AUDIO_FORMAT}, rate=${config.SAMPLE_RATE}Hz)`,
+			`(format=${config.AUDIO_FORMAT}, rate=${config.SAMPLE_RATE}Hz, ` +
+			`ring=${config.RING_BUFFER_SECONDS}s, hwm=${config.HIGH_WATER_MARK})`,
 	);
 
 	let shuttingDown = false;

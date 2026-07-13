@@ -1,3 +1,4 @@
+import { Transform, type TransformCallback } from "node:stream";
 import WebSocket from "ws";
 import { AudioProcessor } from "./audio-processor.js";
 import type { Config } from "./config.js";
@@ -9,7 +10,6 @@ export interface GatewaySessionOptions {
 	client: WebSocket;
 	config: Config;
 	log?: GatewayLogFn;
-	/** Optional connection id for log correlation. */
 	sessionId?: string;
 }
 
@@ -18,14 +18,43 @@ type ClientControlMessage = {
 	[key: string]: unknown;
 };
 
+interface UpstreamAudioFrame {
+	base64: string;
+	byteLength: number;
+}
+
 /**
- * Duplex bridge between a browser WebSocket client and Anthropic Realtime WSS.
+ * Object-mode Transform with a strict highWaterMark.
+ * When the outbound side backs up, `write()` returns false and the gateway
+ * pauses the browser WebSocket until the Anthropic socket drains.
+ */
+class UpstreamAudioTransform extends Transform {
+	constructor(highWaterMark: number) {
+		super({
+			objectMode: true,
+			allowHalfOpen: false,
+			highWaterMark: Math.max(1, Math.floor(highWaterMark / 4_096)),
+		});
+	}
+
+	override _transform(
+		chunk: UpstreamAudioFrame,
+		_encoding: BufferEncoding,
+		callback: TransformCallback,
+	): void {
+		callback(null, chunk);
+	}
+}
+
+/**
+ * Duplex bridge: browser WS ↔ Anthropic Realtime WSS.
  *
- * Backpressure strategy:
- * - Track estimated outbound buffered bytes toward upstream.
- * - When buffered bytes exceed MAX_BUFFERED_BYTES, pause accepting client audio
- *   (pause() on the ws readable side) and drop silence-only frames.
- * - Resume when the drain event fires or buffered estimate drops.
+ * Backpressure / circuit breaking:
+ * - Frames flow through an object-mode Transform bounded by HIGH_WATER_MARK.
+ * - Anthropic `bufferedAmount` is polled; when it exceeds the mark, emit
+ *   `gateway.pause`, call `client.pause()`, and stop accepting audio.
+ * - On drain / buffer clear, emit `gateway.resume` and `client.resume()`.
+ * - Guarantees the gateway RAM footprint stays bounded under upstream throttle.
  */
 export class GatewaySession {
 	readonly sessionId: string;
@@ -35,13 +64,16 @@ export class GatewaySession {
 	private readonly log: GatewayLogFn;
 	private readonly processor: AudioProcessor;
 	private readonly vadState = createVadState();
+	private readonly outbound: UpstreamAudioTransform;
 
 	private upstream: WebSocket | null = null;
 	private closed = false;
 	private clientPaused = false;
+	private circuitOpen = false;
 	private bufferedBytes = 0;
 	private rateLimitAttempts = 0;
 	private rateLimitTimer: ReturnType<typeof setTimeout> | null = null;
+	private pressureTimer: ReturnType<typeof setInterval> | null = null;
 	private silenceDroppedFrames = 0;
 	private speechFramesSent = 0;
 
@@ -54,20 +86,21 @@ export class GatewaySession {
 			format: this.config.AUDIO_FORMAT,
 			sampleRate: this.config.SAMPLE_RATE,
 			chunkDurationMs: this.config.CHUNK_DURATION_MS,
+			ringBufferSeconds: this.config.RING_BUFFER_SECONDS,
 		});
+		this.outbound = new UpstreamAudioTransform(this.config.HIGH_WATER_MARK);
+		this.wireOutboundPipeline();
 	}
 
-	/** Open upstream connection and wire duplex handlers. */
 	async start(): Promise<void> {
 		if (this.closed) {
 			return;
 		}
-
 		this.bindClientHandlers();
 		await this.connectUpstream();
+		this.startPressureMonitor();
 	}
 
-	/** Gracefully tear down both sockets and timers. */
 	close(code = 1000, reason = "gateway_shutdown"): void {
 		if (this.closed) {
 			return;
@@ -78,9 +111,14 @@ export class GatewaySession {
 			clearTimeout(this.rateLimitTimer);
 			this.rateLimitTimer = null;
 		}
+		if (this.pressureTimer) {
+			clearInterval(this.pressureTimer);
+			this.pressureTimer = null;
+		}
 
-		this.resumeClient();
+		this.resumeClient("shutdown");
 		this.processor.reset();
+		this.outbound.destroy();
 
 		this.safeClose(this.client, code, reason);
 		if (this.upstream) {
@@ -92,6 +130,27 @@ export class GatewaySession {
 			"info",
 			`[${this.sessionId}] closed (speech=${this.speechFramesSent}, silenceDropped=${this.silenceDroppedFrames})`,
 		);
+	}
+
+	private wireOutboundPipeline(): void {
+		this.outbound.on("data", (frame: UpstreamAudioFrame) => {
+			this.dispatchUpstreamFrame(frame);
+		});
+		this.outbound.on("drain", () => {
+			this.evaluateBackpressure("transform_drain");
+		});
+		this.outbound.on("error", (err: Error) => {
+			this.log("error", `[${this.sessionId}] outbound transform error: ${err.message}`);
+			this.close(1011, "outbound_error");
+		});
+	}
+
+	private startPressureMonitor(): void {
+		// ws does not always emit drain; poll bufferedAmount for circuit breaking.
+		this.pressureTimer = setInterval(() => {
+			this.evaluateBackpressure("monitor");
+		}, 25);
+		this.pressureTimer.unref();
 	}
 
 	private async connectUpstream(): Promise<void> {
@@ -133,6 +192,8 @@ export class GatewaySession {
 			sessionId: this.sessionId,
 			audioFormat: this.config.AUDIO_FORMAT,
 			sampleRate: this.config.SAMPLE_RATE,
+			ringBufferSamples: this.processor.ringCapacitySamples,
+			highWaterMark: this.config.HIGH_WATER_MARK,
 		});
 		this.log("info", `[${this.sessionId}] upstream connected`);
 	}
@@ -152,7 +213,7 @@ export class GatewaySession {
 
 	private bindClientHandlers(): void {
 		this.client.on("message", (data, isBinary) => {
-			void this.onClientMessage(data, isBinary);
+			this.onClientMessage(data, isBinary);
 		});
 		this.client.on("close", (code, reason) => {
 			this.log(
@@ -164,9 +225,6 @@ export class GatewaySession {
 		this.client.on("error", (err) => {
 			this.log("error", `[${this.sessionId}] client error: ${err.message}`);
 			this.close(1011, "client_error");
-		});
-		this.client.on("drain", () => {
-			this.resumeClient();
 		});
 	}
 
@@ -196,11 +254,11 @@ export class GatewaySession {
 		});
 		upstream.on("drain", () => {
 			this.bufferedBytes = Math.min(this.bufferedBytes, upstream.bufferedAmount);
-			this.resumeClient();
+			this.evaluateBackpressure("upstream_drain");
 		});
 	}
 
-	private async onClientMessage(data: WebSocket.RawData, isBinary: boolean): Promise<void> {
+	private onClientMessage(data: WebSocket.RawData, isBinary: boolean): void {
 		if (this.closed) {
 			return;
 		}
@@ -222,18 +280,9 @@ export class GatewaySession {
 			return;
 		}
 
-		if (this.clientPaused) {
-			// Under backpressure: only keep speech frames if we somehow still receive them
-			const speech = isSpeech(audio, this.vadState, {
-				energyThreshold: this.config.VAD_ENERGY_THRESHOLD,
-				hangoverMs: this.config.VAD_HANGOVER_MS,
-				sampleRate: this.config.SAMPLE_RATE,
-				encoding: this.config.AUDIO_FORMAT,
-			});
-			if (!speech) {
-				this.silenceDroppedFrames += 1;
-				return;
-			}
+		if (this.clientPaused || this.circuitOpen) {
+			this.silenceDroppedFrames += 1;
+			return;
 		}
 
 		const chunks = this.processor.push(audio);
@@ -274,7 +323,9 @@ export class GatewaySession {
 
 	private forwardAudioChunk(chunk: Buffer): void {
 		const speech = isSpeech(chunk, this.vadState, {
-			energyThreshold: this.config.VAD_ENERGY_THRESHOLD,
+			entropyThreshold: this.config.VAD_ENTROPY_THRESHOLD,
+			energyFloor: this.config.VAD_ENERGY_FLOOR,
+			fricativeRatio: this.config.VAD_FRICATIVE_RATIO,
 			hangoverMs: this.config.VAD_HANGOVER_MS,
 			sampleRate: this.config.SAMPLE_RATE,
 			encoding: this.config.AUDIO_FORMAT,
@@ -286,25 +337,33 @@ export class GatewaySession {
 		}
 
 		if (this.isBackpressured()) {
-			this.pauseClient();
+			this.pauseClient("high_water");
 			this.silenceDroppedFrames += 1;
-			this.log(
-				"warn",
-				`[${this.sessionId}] backpressure: dropping frame (buffered=${this.bufferedBytes})`,
-			);
 			return;
 		}
 
+		const frame: UpstreamAudioFrame = {
+			base64: this.processor.toBase64(chunk),
+			byteLength: chunk.byteLength,
+		};
+
+		const ok = this.outbound.write(frame);
+		if (!ok) {
+			this.pauseClient("transform_high_water");
+		}
+	}
+
+	private dispatchUpstreamFrame(frame: UpstreamAudioFrame): void {
 		if (
 			!this.sendUpstreamJson({
 				type: "input_audio_buffer.append",
-				audio: this.processor.toBase64(chunk),
+				audio: frame.base64,
 			})
 		) {
 			return;
 		}
 		this.speechFramesSent += 1;
-		this.maybeApplyBackpressure();
+		this.evaluateBackpressure("after_send");
 	}
 
 	private onUpstreamMessage(data: WebSocket.RawData, isBinary: boolean): void {
@@ -333,7 +392,6 @@ export class GatewaySession {
 			return;
 		}
 
-		// Relay audio deltas as binary when present for lower client latency
 		if (this.tryRelayAudioDelta(parsed)) {
 			return;
 		}
@@ -366,7 +424,6 @@ export class GatewaySession {
 		try {
 			const audio = this.processor.fromBase64(audioB64);
 			this.sendClientBinary(audio);
-			// Also forward the original JSON so clients that expect events still work
 			this.sendClientText(JSON.stringify(parsed));
 			return true;
 		} catch {
@@ -397,10 +454,7 @@ export class GatewaySession {
 				code.includes("overloaded")
 			);
 		}
-		if (typeof event.type === "string" && event.type.includes("rate_limit")) {
-			return true;
-		}
-		return false;
+		return typeof event.type === "string" && event.type.includes("rate_limit");
 	}
 
 	private handleRateLimit(parsed: unknown): void {
@@ -415,7 +469,7 @@ export class GatewaySession {
 			`[${this.sessionId}] rate limited; backing off ${delay}ms (attempt ${this.rateLimitAttempts})`,
 		);
 
-		this.pauseClient();
+		this.pauseClient("rate_limit");
 		this.sendClientEvent({
 			type: "gateway.rate_limited",
 			delayMs: delay,
@@ -429,7 +483,7 @@ export class GatewaySession {
 		this.rateLimitTimer = setTimeout(() => {
 			this.rateLimitTimer = null;
 			this.rateLimitAttempts = Math.max(0, this.rateLimitAttempts - 1);
-			this.resumeClient();
+			this.resumeClient("rate_limit_cleared");
 			this.sendClientEvent({
 				type: "gateway.rate_limit_cleared",
 				sessionId: this.sessionId,
@@ -437,55 +491,91 @@ export class GatewaySession {
 		}, delay);
 	}
 
-	private isBackpressured(): boolean {
-		const upstreamBuffered = this.upstream?.bufferedAmount ?? 0;
-		return this.bufferedBytes + upstreamBuffered >= this.config.MAX_BUFFERED_BYTES;
+	private upstreamBuffered(): number {
+		return this.upstream?.bufferedAmount ?? 0;
 	}
 
-	private maybeApplyBackpressure(): void {
+	private isBackpressured(): boolean {
+		const upstream = this.upstreamBuffered();
+		return (
+			upstream >= this.config.HIGH_WATER_MARK ||
+			this.bufferedBytes + upstream >= this.config.MAX_BUFFERED_BYTES ||
+			this.outbound.writableLength >= this.outbound.writableHighWaterMark
+		);
+	}
+
+	private evaluateBackpressure(_reason: string): void {
+		if (this.closed) {
+			return;
+		}
 		if (this.isBackpressured()) {
-			this.pauseClient();
+			this.pauseClient("high_water");
+		} else {
+			this.resumeClient("drained");
 		}
 	}
 
-	private pauseClient(): void {
-		if (this.clientPaused || this.closed) {
+	private pauseClient(reason: string): void {
+		if (this.closed) {
+			return;
+		}
+		this.circuitOpen = true;
+		if (this.clientPaused) {
 			return;
 		}
 		this.clientPaused = true;
 		try {
 			this.client.pause();
 		} catch {
-			// ws.pause may throw if already closed
+			// ignore
 		}
+		const bufferedBytes = this.bufferedBytes + this.upstreamBuffered();
+		this.sendClientEvent({
+			type: "gateway.pause",
+			reason,
+			bufferedBytes,
+			highWaterMark: this.config.HIGH_WATER_MARK,
+		});
 		this.sendClientEvent({
 			type: "gateway.backpressure",
 			paused: true,
-			bufferedBytes: this.bufferedBytes,
+			reason,
+			bufferedBytes,
 		});
-		this.log("debug", `[${this.sessionId}] client paused (backpressure)`);
+		this.log("warn", `[${this.sessionId}] pause client (${reason}, buffered=${bufferedBytes})`);
 	}
 
-	private resumeClient(): void {
-		if (!this.clientPaused || this.closed) {
+	private resumeClient(reason: string): void {
+		if (this.closed) {
 			return;
 		}
-		if (this.isBackpressured()) {
+		if (this.isBackpressured() && reason !== "shutdown") {
+			return;
+		}
+		this.circuitOpen = false;
+		if (!this.clientPaused) {
 			return;
 		}
 		this.clientPaused = false;
-		this.bufferedBytes = this.upstream?.bufferedAmount ?? 0;
+		this.bufferedBytes = this.upstreamBuffered();
 		try {
 			this.client.resume();
 		} catch {
 			// ignore
 		}
+		const bufferedBytes = this.bufferedBytes;
+		this.sendClientEvent({
+			type: "gateway.resume",
+			reason,
+			bufferedBytes,
+		});
 		this.sendClientEvent({
 			type: "gateway.backpressure",
 			paused: false,
-			bufferedBytes: this.bufferedBytes,
+			reason,
+			bufferedBytes,
 		});
-		this.log("debug", `[${this.sessionId}] client resumed`);
+		this.log("info", `[${this.sessionId}] resume client (${reason})`);
 	}
 
 	private sendUpstreamJson(payload: Record<string, unknown>): boolean {
@@ -506,14 +596,11 @@ export class GatewaySession {
 				this.log("error", `[${this.sessionId}] upstream send failed: ${err.message}`);
 			} else {
 				this.bufferedBytes = Math.max(0, this.bufferedBytes - bytes);
-				if (!this.isBackpressured()) {
-					this.resumeClient();
-				}
+				this.evaluateBackpressure("send_ack");
 			}
 		});
-		// Node ws buffers asynchronously; use bufferedAmount as the live pressure signal.
-		if (upstream.bufferedAmount + this.bufferedBytes >= this.config.MAX_BUFFERED_BYTES) {
-			this.pauseClient();
+		if (upstream.bufferedAmount >= this.config.HIGH_WATER_MARK) {
+			this.pauseClient("upstream_bufferedAmount");
 		}
 		return true;
 	}

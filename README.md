@@ -1,6 +1,6 @@
 # Anthropic Live-Audio Stream Gateway
 
-Production-grade Node.js TypeScript WebSocket gateway that accepts raw browser audio (16-bit PCM @ 24 kHz or Opus), applies energy-based Voice Activity Detection to skip silence, and duplex-bridges the stream to Anthropic's Realtime WSS API with explicit backpressure handling.
+Production-grade Node.js TypeScript WebSocket gateway that accepts raw browser audio (16-bit PCM @ 24 kHz or Opus), applies spectral-entropy Voice Activity Detection (with a 400ms hangover), and duplex-bridges the stream to Anthropic's Realtime WSS API through a Zero-GC ring buffer and Transform-stream backpressure.
 
 **License:** [GNU Affero General Public License v3.0 only](LICENSE) (`AGPL-3.0-only`)
 
@@ -19,9 +19,9 @@ Browser mic (PCM16 / Opus)
                 │
                 ▼
 ┌───────────────────────────────┐
-│  src/gateway.ts               │  Duplex bridge + backpressure
-│    ├─ vad-util.ts             │  Drop pure silence (PCM energy)
-│    └─ audio-processor.ts      │  Chunk + base64 encode
+│  src/gateway.ts               │  Transform pipeline + circuit breaker
+│    ├─ vad-util.ts             │  Spectral entropy + 400ms hangover
+│    └─ audio-processor.ts      │  Int16Array ring buffer (Zero-GC)
 └───────────────┬───────────────┘
                 │  WSS + x-api-key
                 ▼
@@ -31,10 +31,10 @@ Browser mic (PCM16 / Opus)
 | Module | Role |
 | --- | --- |
 | [`src/index.ts`](src/index.ts) | HTTP server, `/health`, WebSocket accept, SIGINT/SIGTERM drain |
-| [`src/gateway.ts`](src/gateway.ts) | One client ↔ one upstream session; backpressure; rate-limit backoff |
-| [`src/audio-processor.ts`](src/audio-processor.ts) | PCM framing, Opus passthrough, base64, client message decode |
-| [`src/vad-util.ts`](src/vad-util.ts) | RMS energy VAD with hangover; Opus packets always forward |
-| [`src/config.ts`](src/config.ts) | Strict Zod validation of environment variables |
+| [`src/gateway.ts`](src/gateway.ts) | Duplex bridge; `HIGH_WATER_MARK` pause/resume; rate-limit backoff |
+| [`src/audio-processor.ts`](src/audio-processor.ts) | Pre-allocated PCM ring + Buffer pool; Opus passthrough |
+| [`src/vad-util.ts`](src/vad-util.ts) | Spectral-entropy VAD + fricative rescue + hangover |
+| [`src/config.ts`](src/config.ts) | Boot-time Zod validation; `sk-ant-` key prefix; `process.exit(1)` on failure |
 
 ## Requirements
 
@@ -71,23 +71,28 @@ npm start
 
 | Variable | Default | Description |
 | --- | --- | --- |
+| `NODE_ENV` | `development` | `development` \| `production` \| `test` |
 | `PORT` | `8080` | Listen port |
 | `HOST` | `0.0.0.0` | Bind address |
 | `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
-| `ANTHROPIC_API_KEY` | *(required)* | API key sent as `x-api-key` / Bearer |
+| `ANTHROPIC_API_KEY` | *(required)* | Must start with `sk-ant-` |
 | `ANTHROPIC_REALTIME_WSS_URL` | `wss://api.anthropic.com/v1/realtime` | Upstream WebSocket URL |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Model for `session.update` |
 | `ANTHROPIC_API_VERSION` | `2023-06-01` | `anthropic-version` header |
 | `AUDIO_FORMAT` | `pcm16` | `pcm16` or `opus` |
 | `SAMPLE_RATE` | `24000` | PCM sample rate (Hz) |
 | `CHUNK_DURATION_MS` | `40` | PCM chunk size target |
-| `VAD_ENERGY_THRESHOLD` | `0.01` | Normalized RMS; `0` disables VAD |
-| `VAD_HANGOVER_MS` | `300` | Keep streaming after energy drops |
-| `MAX_BUFFERED_BYTES` | `1048576` | Pause client when upstream buffer exceeds this |
+| `RING_BUFFER_SECONDS` | `10` | Pre-allocated Int16Array ring capacity |
+| `VAD_ENTROPY_THRESHOLD` | `7.5` | Max spectral entropy (bits); `0` disables |
+| `VAD_ENERGY_FLOOR` | `0.0015` | Minimum RMS so digital silence never passes |
+| `VAD_FRICATIVE_RATIO` | `0.18` | High-band power ratio for s/f/th rescue |
+| `VAD_HANGOVER_MS` | `400` | Hold open after last speech detection |
+| `HIGH_WATER_MARK` | `262144` | Pause browser when upstream buffer exceeds this |
+| `MAX_BUFFERED_BYTES` | `1048576` | Hard ceiling before circuit opens |
 | `RATE_LIMIT_BASE_DELAY_MS` | `500` | Initial backoff on rate limit |
 | `RATE_LIMIT_MAX_DELAY_MS` | `30000` | Cap for exponential backoff |
 
-Copy [`.env.example`](.env.example) and fill in secrets. Never commit `.env`.
+Misconfigured env (including a key that does not start with `sk-ant-`) prints a boot error and exits before port bind. Copy [`.env.example`](.env.example) and fill in secrets. Never commit `.env`.
 
 ## Client protocol
 
@@ -102,7 +107,7 @@ Copy [`.env.example`](.env.example) and fill in secrets. Never commit `.env`.
 5. Receive:
    - Binary audio deltas from the model (when present)
    - Upstream JSON events (transcripts, errors, etc.)
-   - Gateway events: `gateway.backpressure`, `gateway.rate_limited`, `gateway.upstream_closed`, `gateway.error`
+   - Gateway events: `gateway.pause` / `gateway.resume`, `gateway.backpressure`, `gateway.rate_limited`, `gateway.upstream_closed`, `gateway.error`
 
 ### Browser sketch (PCM)
 
@@ -124,14 +129,26 @@ ws.onmessage = (ev) => {
 
 ## Backpressure & resilience
 
-- Outbound upstream send size is tracked; when `bufferedAmount` / queued bytes exceed `MAX_BUFFERED_BYTES`, the client socket is **paused** and silence continues to be dropped.
-- On `drain` (or when the buffer clears), the client is **resumed** and a `gateway.backpressure` event is emitted.
-- Upstream `429` / `rate_limit_*` / overloaded errors trigger exponential backoff, client pause, and `gateway.rate_limited` / `gateway.rate_limit_cleared` events.
+- Audio frames flow through an object-mode `Transform` bounded by `HIGH_WATER_MARK`.
+- When Anthropic `bufferedAmount` (or the transform queue) exceeds the mark, the gateway emits **`gateway.pause`**, calls `client.pause()`, and stops accepting audio so the browser queues locally.
+- On drain / buffer clear it emits **`gateway.resume`** and resumes the socket. Memory on the gateway stays bounded regardless of upstream throttle.
+- Upstream `429` / `rate_limit_*` / overloaded errors trigger exponential backoff plus the same pause/resume path.
 - Either side disconnecting closes the peer cleanly; process `SIGINT`/`SIGTERM` drains all sessions.
+
+## Zero-GC audio path
+
+PCM ingest writes into a pre-allocated `Int16Array` ring (`RING_BUFFER_SECONDS`, default 10s) with a rotating Buffer pool for chunk emit. No `Buffer.concat` in the hot path — eliminating GC pauses that cause audible jitter.
 
 ## Voice Activity Detection
 
-For `pcm16`, each chunk's RMS energy is compared to `VAD_ENERGY_THRESHOLD`. Frames below the threshold are not forwarded (saving tokens), except during a hangover window after recent speech. For `opus`, packets are always forwarded because energy cannot be measured without decoding.
+For `pcm16`, each chunk is analyzed with a Hann-windowed FFT:
+
+1. **Energy floor** — reject digital silence.
+2. **Spectral entropy** — structured speech scores lower than flat noise.
+3. **Fricative rescue** — high-band power ratio recovers trailing “s” / “f” / “th” that RMS gates clip.
+4. **400ms hangover** — after the last positive detection the gate stays open to capture breathing and inter-word pauses before sealing dispatch.
+
+For `opus`, packets are always forwarded (no decode). Set `VAD_ENTROPY_THRESHOLD=0` to disable entropy gating.
 
 ## Scripts
 
