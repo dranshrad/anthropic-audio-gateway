@@ -1,7 +1,16 @@
 import { type IncomingMessage, type ServerResponse, createServer } from "node:http";
 import { type WebSocket, WebSocketServer } from "ws";
+import { authenticateUpgrade, initAuth, releaseAuthSubject } from "./auth.js";
 import { type Config, type LogLevel, config } from "./config.js";
-import { GatewaySession } from "./gateway.js";
+import { type GatewayLogFn, GatewaySession } from "./gateway.js";
+import {
+	authRejectionsTotal,
+	metricsContentType,
+	renderMetrics,
+	sessionsActive,
+} from "./metrics/prometheus.js";
+import { SessionManager } from "./session/manager.js";
+import { attachWebRtcIngress, handleWebRtcInfo } from "./webrtc/ingress.js";
 
 const LOG_LEVEL_ORDER: Record<LogLevel, number> = {
 	debug: 10,
@@ -10,9 +19,9 @@ const LOG_LEVEL_ORDER: Record<LogLevel, number> = {
 	error: 40,
 };
 
-function createLogger(minLevel: LogLevel) {
+function createLogger(minLevel: LogLevel): GatewayLogFn {
 	const min = LOG_LEVEL_ORDER[minLevel];
-	return (level: LogLevel, message: string): void => {
+	return (level, message) => {
 		if (LOG_LEVEL_ORDER[level] < min) {
 			return;
 		}
@@ -41,29 +50,56 @@ function handleHttpRequest(
 	req: IncomingMessage,
 	res: ServerResponse,
 	cfg: Config,
-	activeSessions: number,
+	sessions: SessionManager,
 ): void {
 	const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
 	if (req.method === "GET" && (url.pathname === "/health" || url.pathname === "/healthz")) {
+		const agg = sessions.aggregate();
 		sendJson(res, 200, {
 			status: "ok",
 			uptimeSeconds: Math.floor(process.uptime()),
-			activeSessions,
+			activeSessions: agg.activeSessions,
+			speechFrames: agg.speechFrames,
+			silenceDropped: agg.silenceDropped,
+			vadTriggers: agg.vadTriggers,
+			avgSilenceRatio: agg.avgSilenceRatio,
+			provider: cfg.PROVIDER,
 			audioFormat: cfg.AUDIO_FORMAT,
 			sampleRate: cfg.SAMPLE_RATE,
 			nodeEnv: cfg.NODE_ENV,
+			adaptiveStreaming: cfg.ADAPTIVE_STREAMING,
+			webrtcIngress: cfg.WEBRTC_INGRESS,
 		});
+		return;
+	}
+
+	if (req.method === "GET" && url.pathname === "/metrics" && cfg.METRICS_ENABLED) {
+		void renderMetrics().then((body) => {
+			res.writeHead(200, {
+				"content-type": metricsContentType(),
+				"cache-control": "no-store",
+			});
+			res.end(body);
+		});
+		return;
+	}
+
+	if (req.method === "GET" && url.pathname === "/webrtc/info") {
+		handleWebRtcInfo(req, res);
 		return;
 	}
 
 	if (req.method === "GET" && url.pathname === "/") {
 		sendJson(res, 200, {
 			name: "anthropic-audio-gateway",
-			version: "1.0.0",
+			version: "0.2.0",
 			license: "AGPL-3.0-only",
-			websocket: "Connect via WebSocket to this host to stream audio",
+			provider: cfg.PROVIDER,
+			websocket: "/",
+			webrtc: cfg.WEBRTC_INGRESS ? "/webrtc" : null,
 			health: "/health",
+			metrics: cfg.METRICS_ENABLED ? "/metrics" : null,
 		});
 		return;
 	}
@@ -72,39 +108,62 @@ function handleHttpRequest(
 }
 
 async function main(): Promise<void> {
-	// `config` is validated at module load — if we reached here, env is sane.
 	const log = createLogger(config.LOG_LEVEL);
-	const sessions = new Map<string, GatewaySession>();
+	initAuth(config);
+	const sessions = new SessionManager();
 
 	const server = createServer((req, res) => {
-		handleHttpRequest(req, res, config, sessions.size);
+		handleHttpRequest(req, res, config, sessions);
 	});
 
-	const wss = new WebSocketServer({
-		server,
-		perMessageDeflate: false,
-		maxPayload: 8 * 1024 * 1024,
-	});
-
-	wss.on("connection", (socket: WebSocket, req: IncomingMessage) => {
-		const remote = req.socket.remoteAddress ?? "unknown";
-		const session = new GatewaySession({
+	const createSession = (socket: WebSocket) =>
+		new GatewaySession({
 			client: socket,
 			config,
 			log,
 		});
-		sessions.set(session.sessionId, session);
-		log("info", `client connected from ${remote} session=${session.sessionId}`);
+
+	const wss = new WebSocketServer({
+		server,
+		path: "/",
+		perMessageDeflate: false,
+		maxPayload: 8 * 1024 * 1024,
+		verifyClient: (info, done) => {
+			const auth = authenticateUpgrade(info.req, config);
+			if (!auth.ok) {
+				authRejectionsTotal.inc({ reason: auth.reason ?? "invalid_token" });
+				done(false, 401, auth.reason ?? "unauthorized");
+				return;
+			}
+			const req = info.req as IncomingMessage & { authSubject?: string };
+			if (auth.subject !== undefined) {
+				req.authSubject = auth.subject;
+			}
+			done(true);
+		},
+	});
+
+	wss.on("connection", (socket: WebSocket, req: IncomingMessage) => {
+		const remote = req.socket.remoteAddress ?? "unknown";
+		const subject = (req as IncomingMessage & { authSubject?: string }).authSubject ?? "anonymous";
+		const session = createSession(socket);
+		sessions.add(session);
+		sessionsActive.set(sessions.size);
+		log("info", `client connected from ${remote} session=${session.sessionId} sub=${subject}`);
 
 		socket.on("close", () => {
-			sessions.delete(session.sessionId);
+			sessions.remove(session.sessionId);
+			sessionsActive.set(sessions.size);
+			releaseAuthSubject(subject);
 		});
 
 		void session.start().catch((err: unknown) => {
 			const message = err instanceof Error ? err.message : String(err);
 			log("error", `[${session.sessionId}] failed to start: ${message}`);
 			session.close(1011, "upstream_connect_failed");
-			sessions.delete(session.sessionId);
+			sessions.remove(session.sessionId);
+			sessionsActive.set(sessions.size);
+			releaseAuthSubject(subject);
 			if (socket.readyState === socket.OPEN) {
 				socket.send(
 					JSON.stringify({
@@ -120,6 +179,16 @@ async function main(): Promise<void> {
 		log("error", `WebSocket server error: ${err.message}`);
 	});
 
+	if (config.WEBRTC_INGRESS) {
+		attachWebRtcIngress({
+			server,
+			config,
+			sessions,
+			log,
+			createSession,
+		});
+	}
+
 	await new Promise<void>((resolve, reject) => {
 		server.listen(config.PORT, config.HOST, () => resolve());
 		server.once("error", reject);
@@ -127,9 +196,9 @@ async function main(): Promise<void> {
 
 	log(
 		"info",
-		`Anthropic Live-Audio Stream Gateway listening on ws://${config.HOST}:${config.PORT} ` +
-			`(format=${config.AUDIO_FORMAT}, rate=${config.SAMPLE_RATE}Hz, ` +
-			`ring=${config.RING_BUFFER_SECONDS}s, hwm=${config.HIGH_WATER_MARK})`,
+		`Audio gateway listening on ws://${config.HOST}:${config.PORT} ` +
+			`provider=${config.PROVIDER} format=${config.AUDIO_FORMAT} ` +
+			`metrics=${config.METRICS_ENABLED} webrtc=${config.WEBRTC_INGRESS}`,
 	);
 
 	let shuttingDown = false;
@@ -139,12 +208,8 @@ async function main(): Promise<void> {
 		}
 		shuttingDown = true;
 		log("info", `received ${signal}; draining ${sessions.size} session(s)`);
-
-		for (const session of sessions.values()) {
-			session.close(1001, "server_shutdown");
-		}
-		sessions.clear();
-
+		sessions.closeAll(1001, "server_shutdown");
+		sessionsActive.set(0);
 		wss.close();
 		server.close((err) => {
 			if (err) {
@@ -154,7 +219,6 @@ async function main(): Promise<void> {
 			log("info", "shutdown complete");
 			process.exit(0);
 		});
-
 		setTimeout(() => {
 			log("warn", "forced exit after drain timeout");
 			process.exit(1);

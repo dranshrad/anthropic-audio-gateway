@@ -1,185 +1,132 @@
 # Anthropic Live-Audio Stream Gateway
 
-Production-grade Node.js TypeScript WebSocket gateway that accepts raw browser audio (16-bit PCM @ 24 kHz or Opus), applies spectral-entropy Voice Activity Detection (with a 400ms hangover), and duplex-bridges the stream to Anthropic's Realtime WSS API through a Zero-GC ring buffer and Transform-stream backpressure.
+AGPL-3.0 real-time AI audio runtime: browser (or WebRTC-bridged) PCM/Opus → provider adapters (Anthropic, OpenAI, Gemini, Deepgram, Mock) with Zero-GC ring buffers, spectral-entropy VAD, Transform backpressure, Prometheus metrics, plugins, and adaptive streaming.
 
-**License:** [GNU Affero General Public License v3.0 only](LICENSE) (`AGPL-3.0-only`)
+**Version:** 0.2.0 · **License:** [AGPL-3.0-only](LICENSE)
 
-> **Upstream note:** Anthropic's public Messages API is HTTP/SSE today. This gateway speaks a Realtime-style WebSocket event protocol (`session.update`, `input_audio_buffer.append`, audio deltas, rate-limit errors) against a configurable `ANTHROPIC_REALTIME_WSS_URL`. Point that URL at a compatible Realtime endpoint (or your own adapter) before production use.
+> Anthropic’s public Messages API is HTTP/SSE today. Realtime-style WSS URLs are configurable per provider. Use `PROVIDER=mock` for local/CI work without cloud credentials.
 
 ## Architecture
 
-```
-Browser mic (PCM16 / Opus)
-        │  WebSocket binary or JSON
-        ▼
-┌───────────────────────────────┐
-│  src/index.ts  (:8080)        │  HTTP /health + WS upgrade
-│  per-connection GatewaySession│
-└───────────────┬───────────────┘
-                │
-                ▼
-┌───────────────────────────────┐
-│  src/gateway.ts               │  Transform pipeline + circuit breaker
-│    ├─ vad-util.ts             │  Spectral entropy + 400ms hangover
-│    └─ audio-processor.ts      │  Int16Array ring buffer (Zero-GC)
-└───────────────┬───────────────┘
-                │  WSS + x-api-key
-                ▼
-     Anthropic Realtime WSS
+```mermaid
+sequenceDiagram
+  participant Browser
+  participant Gateway
+  participant VAD
+  participant Ring as PcmRingBuffer
+  participant Adapter as ProviderAdapter
+  participant Upstream
+
+  Browser->>Gateway: binary PCM / Opus
+  Gateway->>Ring: write (Zero-GC)
+  Ring-->>Gateway: fixed chunks
+  Gateway->>VAD: spectral entropy + hangover
+  alt speech
+    Gateway->>Adapter: input_audio_buffer.append
+    Adapter->>Upstream: provider protocol
+    Upstream-->>Adapter: audio / transcript events
+    Adapter-->>Gateway: normalized messages
+    Gateway-->>Browser: binary + JSON
+  else silence / backpressure
+    Gateway-->>Browser: gateway.pause
+  end
 ```
 
-| Module | Role |
+| Layer | Module |
 | --- | --- |
-| [`src/index.ts`](src/index.ts) | HTTP server, `/health`, WebSocket accept, SIGINT/SIGTERM drain |
-| [`src/gateway.ts`](src/gateway.ts) | Duplex bridge; `HIGH_WATER_MARK` pause/resume; rate-limit backoff |
-| [`src/audio-processor.ts`](src/audio-processor.ts) | Pre-allocated PCM ring + Buffer pool; Opus passthrough |
-| [`src/vad-util.ts`](src/vad-util.ts) | Spectral-entropy VAD + fricative rescue + hangover |
-| [`src/config.ts`](src/config.ts) | Boot-time Zod validation; `sk-ant-` key prefix; `process.exit(1)` on failure |
-
-## Requirements
-
-- Node.js **20+**
-- An Anthropic API key
-- A reachable Realtime-compatible WSS endpoint (`ANTHROPIC_REALTIME_WSS_URL`)
+| Ingress | [`src/index.ts`](src/index.ts), [`src/webrtc/ingress.ts`](src/webrtc/ingress.ts), [`src/auth.ts`](src/auth.ts) |
+| Session | [`src/gateway.ts`](src/gateway.ts), [`src/session/stats.ts`](src/session/stats.ts), [`src/session/manager.ts`](src/session/manager.ts) |
+| Audio | [`src/audio-processor.ts`](src/audio-processor.ts) (Int16Array ring) |
+| VAD | [`src/vad/`](src/vad/), [`src/vad-util.ts`](src/vad-util.ts) |
+| Providers | [`src/providers/`](src/providers/) |
+| Plugins / adaptive | [`src/plugins/registry.ts`](src/plugins/registry.ts), [`src/adaptive/controller.ts`](src/adaptive/controller.ts) |
+| Metrics | [`src/metrics/prometheus.ts`](src/metrics/prometheus.ts) → `GET /metrics` |
 
 ## Quick start
 
 ```bash
-git clone <your-fork-url> anthropic-audio-gateway
-cd anthropic-audio-gateway
 cp .env.example .env
-# Edit .env — set ANTHROPIC_API_KEY and ANTHROPIC_REALTIME_WSS_URL
+# PROVIDER=mock for local; or anthropic + sk-ant-... key
 
 npm install
 npm run dev
 ```
 
-The gateway listens on `ws://0.0.0.0:8080` by default.
-
 ```bash
 curl -s http://127.0.0.1:8080/health
+curl -s http://127.0.0.1:8080/metrics | head
 ```
-
-### Production
 
 ```bash
-npm run build
-npm start
+npm run bench          # mock load harness
+npm run typecheck && npm run check && npm run build
 ```
 
-## Environment variables
+## Providers
 
-| Variable | Default | Description |
+| `PROVIDER` | Adapter | Auth env |
 | --- | --- | --- |
-| `NODE_ENV` | `development` | `development` \| `production` \| `test` |
-| `PORT` | `8080` | Listen port |
-| `HOST` | `0.0.0.0` | Bind address |
-| `LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error` |
-| `ANTHROPIC_API_KEY` | *(required)* | Must start with `sk-ant-` |
-| `ANTHROPIC_REALTIME_WSS_URL` | `wss://api.anthropic.com/v1/realtime` | Upstream WebSocket URL |
-| `ANTHROPIC_MODEL` | `claude-sonnet-4-20250514` | Model for `session.update` |
-| `ANTHROPIC_API_VERSION` | `2023-06-01` | `anthropic-version` header |
-| `AUDIO_FORMAT` | `pcm16` | `pcm16` or `opus` |
-| `SAMPLE_RATE` | `24000` | PCM sample rate (Hz) |
-| `CHUNK_DURATION_MS` | `40` | PCM chunk size target |
-| `RING_BUFFER_SECONDS` | `10` | Pre-allocated Int16Array ring capacity |
-| `VAD_ENTROPY_THRESHOLD` | `7.5` | Max spectral entropy (bits); `0` disables |
-| `VAD_ENERGY_FLOOR` | `0.0015` | Minimum RMS so digital silence never passes |
-| `VAD_FRICATIVE_RATIO` | `0.18` | High-band power ratio for s/f/th rescue |
-| `VAD_HANGOVER_MS` | `400` | Hold open after last speech detection |
-| `HIGH_WATER_MARK` | `262144` | Pause browser when upstream buffer exceeds this |
-| `MAX_BUFFERED_BYTES` | `1048576` | Hard ceiling before circuit opens |
-| `RATE_LIMIT_BASE_DELAY_MS` | `500` | Initial backoff on rate limit |
-| `RATE_LIMIT_MAX_DELAY_MS` | `30000` | Cap for exponential backoff |
+| `anthropic` | Realtime-style WSS | `ANTHROPIC_API_KEY` (`sk-ant-…`) |
+| `openai` | OpenAI Realtime | `OPENAI_API_KEY` |
+| `gemini` | Gemini Live WSS | `GEMINI_API_KEY` |
+| `deepgram` | Live listen WSS | `DEEPGRAM_API_KEY` |
+| `mock` | In-process echo | none |
 
-Misconfigured env (including a key that does not start with `sk-ant-`) prints a boot error and exits before port bind. Copy [`.env.example`](.env.example) and fill in secrets. Never commit `.env`.
+## Latency path
 
-## Client protocol
-
-1. Open a WebSocket to the gateway (`ws://host:8080`).
-2. Wait for `{ "type": "gateway.ready", ... }`.
-3. Stream audio as **binary frames** (preferred) or JSON `{ "audio": "<base64>" }`.
-4. Optional control JSON (relayed or handled locally):
-   - `input_audio_buffer.commit`
-   - `input_audio_buffer.clear`
-   - `session.update` / `response.create` / `conversation.item.create`
-   - `gateway.ping` → `gateway.pong`
-5. Receive:
-   - Binary audio deltas from the model (when present)
-   - Upstream JSON events (transcripts, errors, etc.)
-   - Gateway events: `gateway.pause` / `gateway.resume`, `gateway.backpressure`, `gateway.rate_limited`, `gateway.upstream_closed`, `gateway.error`
-
-### Browser sketch (PCM)
-
-```js
-const ws = new WebSocket("ws://localhost:8080");
-ws.binaryType = "arraybuffer";
-
-ws.onmessage = (ev) => {
-  if (typeof ev.data === "string") {
-    console.log(JSON.parse(ev.data));
-  } else {
-    // play PCM / Opus chunk
-  }
-};
-
-// After gateway.ready, send Int16Array PCM buffers:
-// ws.send(pcmInt16.buffer);
+```
+mic → WS frame → ring write → VAD → Transform queue → provider send → upstream
+                                                                    ↓
+browser ← JSON/binary relay ← provider onMessage ←─────────────────┘
 ```
 
-## Backpressure & resilience
+Tune `CHUNK_DURATION_MS`, `HIGH_WATER_MARK`, and enable `ADAPTIVE_STREAMING=true` to adjust chunk/HWM/hangover from live RTT and queue depth.
 
-- Audio frames flow through an object-mode `Transform` bounded by `HIGH_WATER_MARK`.
-- When Anthropic `bufferedAmount` (or the transform queue) exceeds the mark, the gateway emits **`gateway.pause`**, calls `client.pause()`, and stops accepting audio so the browser queues locally.
-- On drain / buffer clear it emits **`gateway.resume`** and resumes the socket. Memory on the gateway stays bounded regardless of upstream throttle.
-- Upstream `429` / `rate_limit_*` / overloaded errors trigger exponential backoff plus the same pause/resume path.
-- Either side disconnecting closes the peer cleanly; process `SIGINT`/`SIGTERM` drains all sessions.
+## Backpressure
 
-## Zero-GC audio path
+When provider `bufferedAmount` or the outbound Transform exceeds `HIGH_WATER_MARK`, the gateway emits `gateway.pause`, pauses the client socket, and resumes with `gateway.resume` on drain.
 
-PCM ingest writes into a pre-allocated `Int16Array` ring (`RING_BUFFER_SECONDS`, default 10s) with a rotating Buffer pool for chunk emit. No `Buffer.concat` in the hot path — eliminating GC pauses that cause audible jitter.
+## Observability
 
-## Voice Activity Detection
+- `GET /health` — sessions, silence ratio, VAD triggers
+- `GET /metrics` — Prometheus (see [`grafana/audio-gateway-dashboard.json`](grafana/audio-gateway-dashboard.json))
+- Session stats: RTT, silence ratio, speaking rate, queue depth, reconnects, rate limits
 
-For `pcm16`, each chunk is analyzed with a Hann-windowed FFT:
+## Auth (v1)
 
-1. **Energy floor** — reject digital silence.
-2. **Spectral entropy** — structured speech scores lower than flat noise.
-3. **Fricative rescue** — high-band power ratio recovers trailing “s” / “f” / “th” that RMS gates clip.
-4. **400ms hangover** — after the last positive detection the gate stays open to capture breathing and inter-word pauses before sealing dispatch.
+Optional HS256 JWT (`AUTH_JWT_SECRET`) via `?token=` or `Authorization: Bearer`. Optional `AUTH_ALLOWED_ORIGINS`, per-subject rate limit and session quotas.
 
-For `opus`, packets are always forwarded (no decode). Set `VAD_ENTROPY_THRESHOLD=0` to disable entropy gating.
+## WebRTC ingress
 
-## Scripts
+`WEBRTC_INGRESS=true` exposes `/webrtc` (offer → synthetic answer → PCM frames on the same socket). Prefer terminating DTLS/SRTP at a media edge and forwarding PCM here — see `GET /webrtc/info`.
 
-| Script | Purpose |
-| --- | --- |
-| `npm run dev` | Run with `tsx` watch |
-| `npm run build` | Compile to `dist/` |
-| `npm start` | Run compiled server |
-| `npm run typecheck` | `tsc --noEmit` |
-| `npm run check` | Biome lint + format check |
-| `npm run lint` | Biome lint only |
-| `npm run format` | Biome format write |
+## Plugins
 
-CI runs typecheck, Biome, and build on Node 20 and 22 ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+Register codecs / VAD / preprocess / analytics / exporters via [`src/plugins/registry.ts`](src/plugins/registry.ts). Built-ins: noise-suppress stub, silence analytics.
 
-## AGPL-3.0 obligations
+## Benchmarks
 
-This software is licensed under the **GNU Affero General Public License v3.0 only**. If you modify it and provide it as a network service (e.g. host this gateway publicly), you must offer the corresponding source code to users of that service under AGPL-3.0. See [LICENSE](LICENSE) for the full terms.
+See [`bench/report.md`](bench/report.md). `npm run bench` prints JSON (p50/p95 latency, throughput, RSS/session).
 
-## Security
+## Kubernetes probes
 
-- Keep `ANTHROPIC_API_KEY` server-side only; never expose it to the browser.
-- Terminate TLS in front of the gateway in production (`wss://`).
-- Restrict who can open WebSocket connections (auth proxy, IP allowlist, or tokens) before exposing this on the public internet.
+```yaml
+livenessProbe:
+  httpGet: { path: /health, port: 8080 }
+readinessProbe:
+  httpGet: { path: /health, port: 8080 }
+```
 
-## Contributing
+Scrape `/metrics` from Prometheus. Scale horizontally with sticky sessions if you add shared session stores later; each replica is memory-bounded by `RING_BUFFER_SECONDS` × sessions × `HIGH_WATER_MARK`.
 
-1. Fork and branch from `main` / `master`.
-2. Run `npm run check && npm run typecheck && npm run build`.
-3. Open a pull request.
+## Environment
+
+See [`.env.example`](.env.example). Boot fails before port bind if the active provider’s credentials are invalid (Anthropic keys must start with `sk-ant-`).
+
+## AGPL-3.0
+
+If you modify this and offer it as a network service, you must provide corresponding source to users under AGPL-3.0. See [LICENSE](LICENSE).
 
 ## Disclaimer
 
-This project is not affiliated with Anthropic PBC. “Anthropic” and “Claude” are trademarks of their respective owners. The Realtime WSS path and event schema are designed for forward compatibility; verify against Anthropic's current documentation before deploying.
+Not affiliated with Anthropic, OpenAI, Google, or Deepgram. Verify provider protocols against current vendor docs before production.

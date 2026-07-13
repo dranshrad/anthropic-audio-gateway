@@ -1,6 +1,6 @@
 {
 	"name": "anthropic-audio-gateway",
-	"version": "1.0.0",
+	"version": "0.2.0",
 	"description": "Production-grade WebSocket gateway that duplex-bridges browser audio streams to Anthropic's Realtime WSS API with VAD and backpressure.",
 	"type": "module",
 	"license": "AGPL-3.0-only",
@@ -16,24 +16,26 @@
 		}
 	},
 	"scripts": {
-		"dev": "tsx watch src/index.ts",
+		"dev": "tsx watch --env-file=.env src/index.ts",
 		"build": "tsc -p tsconfig.json",
-		"start": "node dist/index.js",
+		"start": "node --env-file=.env dist/index.js",
 		"lint": "biome lint .",
 		"format": "biome format --write .",
 		"check": "biome check .",
-		"typecheck": "tsc -p tsconfig.json --noEmit"
+		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"bench": "PROVIDER=mock tsx bench/load-mock.ts"
 	},
 	"keywords": ["anthropic", "websocket", "audio", "realtime", "gateway", "vad", "pcm", "opus"],
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/example/anthropic-audio-gateway.git"
+		"url": "git+https://github.com/dranshrad/anthropic-audio-gateway.git"
 	},
 	"bugs": {
-		"url": "https://github.com/example/anthropic-audio-gateway/issues"
+		"url": "https://github.com/dranshrad/anthropic-audio-gateway/issues"
 	},
-	"homepage": "https://github.com/example/anthropic-audio-gateway#readme",
+	"homepage": "https://github.com/dranshrad/anthropic-audio-gateway#readme",
 	"dependencies": {
+		"prom-client": "^15.1.3",
 		"ws": "^8.18.3",
 		"zod": "^3.25.76"
 	},

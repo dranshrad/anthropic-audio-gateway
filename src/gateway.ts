@@ -1,8 +1,26 @@
 import { Transform, type TransformCallback } from "node:stream";
-import WebSocket from "ws";
+import type WebSocket from "ws";
+import { AdaptiveStreamingController } from "./adaptive/controller.js";
 import { AudioProcessor } from "./audio-processor.js";
 import type { Config } from "./config.js";
-import { createVadState, isSpeech } from "./vad-util.js";
+import {
+	bufferOccupancyGauge,
+	bytesAppendedTotal,
+	pauseTotal,
+	providerErrorsTotal,
+	queueDepthGauge,
+	rateLimitTotal,
+	reconnectsTotal,
+	rttHistogram,
+	silenceDroppedTotal,
+	speechFramesTotal,
+	vadTriggersTotal,
+} from "./metrics/prometheus.js";
+import { pluginRegistry } from "./plugins/registry.js";
+import { getProviderAdapter, resolveProviderModel } from "./providers/registry.js";
+import type { ProviderConnection, ProviderMessage } from "./providers/types.js";
+import { SessionStats } from "./session/stats.js";
+import { getVadEngine } from "./vad/spectral.js";
 
 export type GatewayLogFn = (level: "debug" | "info" | "warn" | "error", message: string) => void;
 
@@ -23,11 +41,6 @@ interface UpstreamAudioFrame {
 	byteLength: number;
 }
 
-/**
- * Object-mode Transform with a strict highWaterMark.
- * When the outbound side backs up, `write()` returns false and the gateway
- * pauses the browser WebSocket until the Anthropic socket drains.
- */
 class UpstreamAudioTransform extends Transform {
 	constructor(highWaterMark: number) {
 		super({
@@ -47,26 +60,25 @@ class UpstreamAudioTransform extends Transform {
 }
 
 /**
- * Duplex bridge: browser WS ↔ Anthropic Realtime WSS.
- *
- * Backpressure / circuit breaking:
- * - Frames flow through an object-mode Transform bounded by HIGH_WATER_MARK.
- * - Anthropic `bufferedAmount` is polled; when it exceeds the mark, emit
- *   `gateway.pause`, call `client.pause()`, and stop accepting audio.
- * - On drain / buffer clear, emit `gateway.resume` and `client.resume()`.
- * - Guarantees the gateway RAM footprint stays bounded under upstream throttle.
+ * Duplex bridge: browser (or WebRTC-bridged) WS ↔ provider adapter.
+ * Keeps Zero-GC processor, Transform backpressure, and VAD gating.
  */
 export class GatewaySession {
 	readonly sessionId: string;
+	readonly stats: SessionStats;
 
 	private readonly client: WebSocket;
 	private readonly config: Config;
 	private readonly log: GatewayLogFn;
 	private readonly processor: AudioProcessor;
-	private readonly vadState = createVadState();
+	private readonly vad;
+	private readonly vadState;
 	private readonly outbound: UpstreamAudioTransform;
+	private readonly adaptive: AdaptiveStreamingController;
+	private readonly providerId;
+	private lastVadSpeech = false;
 
-	private upstream: WebSocket | null = null;
+	private connection: ProviderConnection | null = null;
 	private closed = false;
 	private clientPaused = false;
 	private circuitOpen = false;
@@ -74,31 +86,53 @@ export class GatewaySession {
 	private rateLimitAttempts = 0;
 	private rateLimitTimer: ReturnType<typeof setTimeout> | null = null;
 	private pressureTimer: ReturnType<typeof setInterval> | null = null;
-	private silenceDroppedFrames = 0;
-	private speechFramesSent = 0;
+	private adaptiveTimer: ReturnType<typeof setInterval> | null = null;
+	private hangoverMs: number;
+	private entropyThreshold: number;
+	private highWaterMark: number;
 
 	constructor(options: GatewaySessionOptions) {
 		this.client = options.client;
 		this.config = options.config;
 		this.sessionId = options.sessionId ?? crypto.randomUUID();
 		this.log = options.log ?? defaultLog;
+		this.providerId = this.config.PROVIDER;
+		this.stats = new SessionStats(this.sessionId, this.providerId);
+		this.vad = getVadEngine(this.config.VAD_ENGINE);
+		this.vadState = this.vad.createState();
+		this.hangoverMs = this.config.VAD_HANGOVER_MS;
+		this.entropyThreshold = this.config.VAD_ENTROPY_THRESHOLD;
+		this.highWaterMark = this.config.HIGH_WATER_MARK;
+		this.adaptive = new AdaptiveStreamingController(this.config);
 		this.processor = new AudioProcessor({
 			format: this.config.AUDIO_FORMAT,
 			sampleRate: this.config.SAMPLE_RATE,
 			chunkDurationMs: this.config.CHUNK_DURATION_MS,
 			ringBufferSeconds: this.config.RING_BUFFER_SECONDS,
 		});
-		this.outbound = new UpstreamAudioTransform(this.config.HIGH_WATER_MARK);
+		this.outbound = new UpstreamAudioTransform(this.highWaterMark);
 		this.wireOutboundPipeline();
+	}
+
+	getStats() {
+		return this.stats.snapshot(this.config.SAMPLE_RATE);
 	}
 
 	async start(): Promise<void> {
 		if (this.closed) {
 			return;
 		}
+
+		await pluginRegistry.startAll({
+			sessionId: this.sessionId,
+			sampleRate: this.config.SAMPLE_RATE,
+			audioFormat: this.config.AUDIO_FORMAT,
+		});
+
 		this.bindClientHandlers();
-		await this.connectUpstream();
+		await this.connectProvider();
 		this.startPressureMonitor();
+		this.startAdaptiveLoop();
 	}
 
 	close(code = 1000, reason = "gateway_shutdown"): void {
@@ -115,20 +149,28 @@ export class GatewaySession {
 			clearInterval(this.pressureTimer);
 			this.pressureTimer = null;
 		}
+		if (this.adaptiveTimer) {
+			clearInterval(this.adaptiveTimer);
+			this.adaptiveTimer = null;
+		}
 
 		this.resumeClient("shutdown");
 		this.processor.reset();
 		this.outbound.destroy();
+		this.connection?.close(code, reason);
+		this.connection = null;
 
-		this.safeClose(this.client, code, reason);
-		if (this.upstream) {
-			this.safeClose(this.upstream, code, reason);
-			this.upstream = null;
-		}
+		void pluginRegistry.endAll({
+			sessionId: this.sessionId,
+			sampleRate: this.config.SAMPLE_RATE,
+			audioFormat: this.config.AUDIO_FORMAT,
+		});
+		pluginRegistry.emitStats(this.getStats() as unknown as Record<string, unknown>);
 
+		this.safeCloseClient(code, reason);
 		this.log(
 			"info",
-			`[${this.sessionId}] closed (speech=${this.speechFramesSent}, silenceDropped=${this.silenceDroppedFrames})`,
+			`[${this.sessionId}] closed provider=${this.providerId} speech=${this.stats.speechFramesSent} silenceDropped=${this.stats.silenceDroppedFrames}`,
 		);
 	}
 
@@ -146,69 +188,52 @@ export class GatewaySession {
 	}
 
 	private startPressureMonitor(): void {
-		// ws does not always emit drain; poll bufferedAmount for circuit breaking.
 		this.pressureTimer = setInterval(() => {
 			this.evaluateBackpressure("monitor");
+			const buffered = this.providerBuffered();
+			this.stats.updateQueue(this.outbound.writableLength, buffered);
+			queueDepthGauge.set({ provider: this.providerId }, this.outbound.writableLength);
+			bufferOccupancyGauge.set({ provider: this.providerId }, buffered);
 		}, 25);
 		this.pressureTimer.unref();
 	}
 
-	private async connectUpstream(): Promise<void> {
-		const url = this.config.ANTHROPIC_REALTIME_WSS_URL;
-		this.log("info", `[${this.sessionId}] connecting upstream ${url}`);
+	private startAdaptiveLoop(): void {
+		if (!this.config.ADAPTIVE_STREAMING) {
+			return;
+		}
+		this.adaptiveTimer = setInterval(() => {
+			const next = this.adaptive.update(this.stats);
+			this.hangoverMs = next.vadHangoverMs;
+			this.entropyThreshold = next.vadEntropyThreshold;
+			this.highWaterMark = next.highWaterMark;
+		}, 1_000);
+		this.adaptiveTimer.unref();
+	}
 
-		const upstream = new WebSocket(url, {
-			headers: {
-				"x-api-key": this.config.ANTHROPIC_API_KEY,
-				authorization: `Bearer ${this.config.ANTHROPIC_API_KEY}`,
-				"anthropic-version": this.config.ANTHROPIC_API_VERSION,
-				"anthropic-beta": "realtime-2025-01-01",
-			},
+	private async connectProvider(): Promise<void> {
+		const adapter = getProviderAdapter(this.providerId);
+		this.log("info", `[${this.sessionId}] connecting provider=${adapter.id}`);
+		const connection = await adapter.connect({
+			sessionId: this.sessionId,
+			config: this.config,
+			audioFormat: this.config.AUDIO_FORMAT,
+			sampleRate: this.config.SAMPLE_RATE,
+			model: resolveProviderModel(this.config),
 		});
-
-		this.upstream = upstream;
-
-		await new Promise<void>((resolve, reject) => {
-			const onOpen = () => {
-				cleanup();
-				resolve();
-			};
-			const onError = (err: Error) => {
-				cleanup();
-				reject(err);
-			};
-			const cleanup = () => {
-				upstream.off("open", onOpen);
-				upstream.off("error", onError);
-			};
-			upstream.once("open", onOpen);
-			upstream.once("error", onError);
-		});
-
-		this.bindUpstreamHandlers(upstream);
-		this.sendSessionUpdate(upstream);
+		this.connection = connection;
+		connection.onMessage((msg) => this.onProviderMessage(msg));
 		this.sendClientEvent({
 			type: "gateway.ready",
 			sessionId: this.sessionId,
+			provider: this.providerId,
 			audioFormat: this.config.AUDIO_FORMAT,
 			sampleRate: this.config.SAMPLE_RATE,
 			ringBufferSamples: this.processor.ringCapacitySamples,
-			highWaterMark: this.config.HIGH_WATER_MARK,
+			highWaterMark: this.highWaterMark,
+			vadEngine: this.vad.id,
 		});
-		this.log("info", `[${this.sessionId}] upstream connected`);
-	}
-
-	private sendSessionUpdate(upstream: WebSocket): void {
-		const payload = {
-			type: "session.update",
-			session: {
-				model: this.config.ANTHROPIC_MODEL,
-				input_audio_format: this.config.AUDIO_FORMAT === "pcm16" ? "pcm16" : "opus",
-				output_audio_format: this.config.AUDIO_FORMAT === "pcm16" ? "pcm16" : "opus",
-				turn_detection: null,
-			},
-		};
-		this.sendUpstreamRaw(upstream, JSON.stringify(payload));
+		this.log("info", `[${this.sessionId}] provider connected`);
 	}
 
 	private bindClientHandlers(): void {
@@ -225,36 +250,6 @@ export class GatewaySession {
 		this.client.on("error", (err) => {
 			this.log("error", `[${this.sessionId}] client error: ${err.message}`);
 			this.close(1011, "client_error");
-		});
-	}
-
-	private bindUpstreamHandlers(upstream: WebSocket): void {
-		upstream.on("message", (data, isBinary) => {
-			this.onUpstreamMessage(data, isBinary);
-		});
-		upstream.on("close", (code, reason) => {
-			this.log(
-				"warn",
-				`[${this.sessionId}] upstream closed code=${code} reason=${reason.toString()}`,
-			);
-			this.sendClientEvent({
-				type: "gateway.upstream_closed",
-				code,
-				reason: reason.toString(),
-			});
-			this.close(code === 1000 ? 1000 : 1011, "upstream_closed");
-		});
-		upstream.on("error", (err) => {
-			this.log("error", `[${this.sessionId}] upstream error: ${err.message}`);
-			this.sendClientEvent({
-				type: "gateway.error",
-				message: err.message,
-			});
-			this.close(1011, "upstream_error");
-		});
-		upstream.on("drain", () => {
-			this.bufferedBytes = Math.min(this.bufferedBytes, upstream.bufferedAmount);
-			this.evaluateBackpressure("upstream_drain");
 		});
 	}
 
@@ -275,13 +270,20 @@ export class GatewaySession {
 			return;
 		}
 
-		const audio = decoded.audio;
+		let audio = decoded.audio;
 		if (!audio) {
 			return;
 		}
 
+		audio = pluginRegistry.processFrame(audio, {
+			sessionId: this.sessionId,
+			sampleRate: this.config.SAMPLE_RATE,
+			audioFormat: this.config.AUDIO_FORMAT,
+		});
+
 		if (this.clientPaused || this.circuitOpen) {
-			this.silenceDroppedFrames += 1;
+			this.stats.recordSilenceDrop();
+			silenceDroppedTotal.inc({ provider: this.providerId });
 			return;
 		}
 
@@ -297,12 +299,12 @@ export class GatewaySession {
 			for (const chunk of this.processor.flush()) {
 				this.forwardAudioChunk(chunk);
 			}
-			this.sendUpstreamJson({ type: "input_audio_buffer.commit" });
+			this.connection?.sendControl({ type: "input_audio_buffer.commit" });
 			return;
 		}
 		if (type === "input_audio_buffer.clear") {
 			this.processor.reset();
-			this.sendUpstreamJson({ type: "input_audio_buffer.clear" });
+			this.connection?.sendControl({ type: "input_audio_buffer.clear" });
 			return;
 		}
 		if (
@@ -310,11 +312,17 @@ export class GatewaySession {
 			type === "response.create" ||
 			type === "conversation.item.create"
 		) {
-			this.sendUpstreamJson(message);
+			this.connection?.sendControl(message);
 			return;
 		}
 		if (type === "gateway.ping") {
-			this.sendClientEvent({ type: "gateway.pong", sessionId: this.sessionId });
+			this.stats.markPing();
+			this.sendClientEvent({ type: "gateway.pong", sessionId: this.sessionId, t: Date.now() });
+			this.stats.markPong();
+			const snap = this.stats.snapshot(this.config.SAMPLE_RATE);
+			if (snap.lastRttMs !== null) {
+				rttHistogram.observe({ provider: this.providerId }, snap.lastRttMs);
+			}
 			return;
 		}
 
@@ -322,23 +330,30 @@ export class GatewaySession {
 	}
 
 	private forwardAudioChunk(chunk: Buffer): void {
-		const speech = isSpeech(chunk, this.vadState, {
-			entropyThreshold: this.config.VAD_ENTROPY_THRESHOLD,
+		const speech = this.vad.isSpeech(chunk, this.vadState, {
+			entropyThreshold: this.entropyThreshold,
 			energyFloor: this.config.VAD_ENERGY_FLOOR,
 			fricativeRatio: this.config.VAD_FRICATIVE_RATIO,
-			hangoverMs: this.config.VAD_HANGOVER_MS,
+			hangoverMs: this.hangoverMs,
 			sampleRate: this.config.SAMPLE_RATE,
 			encoding: this.config.AUDIO_FORMAT,
 		});
+		this.stats.recordVad(speech);
+		if (speech && !this.lastVadSpeech) {
+			vadTriggersTotal.inc({ provider: this.providerId });
+		}
+		this.lastVadSpeech = speech;
 
 		if (!speech) {
-			this.silenceDroppedFrames += 1;
+			this.stats.recordSilenceDrop();
+			silenceDroppedTotal.inc({ provider: this.providerId });
 			return;
 		}
 
 		if (this.isBackpressured()) {
 			this.pauseClient("high_water");
-			this.silenceDroppedFrames += 1;
+			this.stats.recordSilenceDrop();
+			silenceDroppedTotal.inc({ provider: this.providerId });
 			return;
 		}
 
@@ -346,7 +361,6 @@ export class GatewaySession {
 			base64: this.processor.toBase64(chunk),
 			byteLength: chunk.byteLength,
 		};
-
 		const ok = this.outbound.write(frame);
 		if (!ok) {
 			this.pauseClient("transform_high_water");
@@ -354,61 +368,57 @@ export class GatewaySession {
 	}
 
 	private dispatchUpstreamFrame(frame: UpstreamAudioFrame): void {
-		if (
-			!this.sendUpstreamJson({
-				type: "input_audio_buffer.append",
-				audio: frame.base64,
-			})
-		) {
+		if (!this.connection?.sendAudioAppend(frame.base64)) {
 			return;
 		}
-		this.speechFramesSent += 1;
+		this.stats.recordSpeechFrame(frame.byteLength, this.config.SAMPLE_RATE);
+		speechFramesTotal.inc({ provider: this.providerId });
+		bytesAppendedTotal.inc({ provider: this.providerId }, frame.byteLength);
 		this.evaluateBackpressure("after_send");
 	}
 
-	private onUpstreamMessage(data: WebSocket.RawData, isBinary: boolean): void {
+	private onProviderMessage(msg: ProviderMessage): void {
 		if (this.closed) {
 			return;
 		}
-
-		const buffer = rawDataToBuffer(data);
-
-		if (isBinary) {
-			this.sendClientBinary(buffer);
+		if (msg.kind === "close") {
+			this.stats.recordReconnect();
+			reconnectsTotal.inc({ provider: this.providerId });
+			this.sendClientEvent({
+				type: "gateway.upstream_closed",
+				code: msg.code,
+				reason: msg.reason,
+			});
+			this.close(msg.code === 1000 ? 1000 : 1011, "upstream_closed");
+			return;
+		}
+		if (msg.kind === "error") {
+			this.stats.recordProviderError();
+			providerErrorsTotal.inc({ provider: this.providerId });
+			this.sendClientEvent({ type: "gateway.error", message: msg.error.message });
+			this.close(1011, "upstream_error");
+			return;
+		}
+		if (msg.kind === "binary") {
+			this.sendClientBinary(msg.data);
 			return;
 		}
 
-		const text = buffer.toString("utf8");
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(text);
-		} catch {
-			this.sendClientBinary(buffer);
+		if (this.isRateLimitEvent(msg.value)) {
+			this.handleRateLimit(msg.value);
 			return;
 		}
-
-		if (this.isRateLimitEvent(parsed)) {
-			this.handleRateLimit(parsed);
+		if (this.tryRelayAudioDelta(msg.value)) {
 			return;
 		}
-
-		if (this.tryRelayAudioDelta(parsed)) {
-			return;
-		}
-
-		this.sendClientText(text);
+		this.sendClientText(msg.raw || JSON.stringify(msg.value));
 	}
 
 	private tryRelayAudioDelta(parsed: unknown): boolean {
 		if (typeof parsed !== "object" || parsed === null) {
 			return false;
 		}
-		const event = parsed as {
-			type?: string;
-			delta?: string;
-			audio?: string;
-		};
-
+		const event = parsed as { type?: string; delta?: string; audio?: string };
 		const audioB64 =
 			(event.type === "response.audio.delta" || event.type === "response.output_audio.delta") &&
 			typeof event.delta === "string"
@@ -416,11 +426,9 @@ export class GatewaySession {
 				: typeof event.audio === "string" && event.type?.includes("audio")
 					? event.audio
 					: null;
-
 		if (!audioB64) {
 			return false;
 		}
-
 		try {
 			const audio = this.processor.fromBase64(audioB64);
 			this.sendClientBinary(audio);
@@ -440,7 +448,6 @@ export class GatewaySession {
 			error?: { type?: string; code?: string; message?: string };
 			status?: number;
 		};
-
 		if (event.status === 429) {
 			return true;
 		}
@@ -459,16 +466,16 @@ export class GatewaySession {
 
 	private handleRateLimit(parsed: unknown): void {
 		this.rateLimitAttempts += 1;
+		this.stats.recordRateLimit();
+		rateLimitTotal.inc({ provider: this.providerId });
 		const delay = Math.min(
 			this.config.RATE_LIMIT_MAX_DELAY_MS,
 			this.config.RATE_LIMIT_BASE_DELAY_MS * 2 ** (this.rateLimitAttempts - 1),
 		);
-
 		this.log(
 			"warn",
 			`[${this.sessionId}] rate limited; backing off ${delay}ms (attempt ${this.rateLimitAttempts})`,
 		);
-
 		this.pauseClient("rate_limit");
 		this.sendClientEvent({
 			type: "gateway.rate_limited",
@@ -476,7 +483,6 @@ export class GatewaySession {
 			attempt: this.rateLimitAttempts,
 			upstream: parsed,
 		});
-
 		if (this.rateLimitTimer) {
 			clearTimeout(this.rateLimitTimer);
 		}
@@ -491,14 +497,14 @@ export class GatewaySession {
 		}, delay);
 	}
 
-	private upstreamBuffered(): number {
-		return this.upstream?.bufferedAmount ?? 0;
+	private providerBuffered(): number {
+		return this.connection?.bufferedAmount() ?? 0;
 	}
 
 	private isBackpressured(): boolean {
-		const upstream = this.upstreamBuffered();
+		const upstream = this.providerBuffered();
 		return (
-			upstream >= this.config.HIGH_WATER_MARK ||
+			upstream >= this.highWaterMark ||
 			this.bufferedBytes + upstream >= this.config.MAX_BUFFERED_BYTES ||
 			this.outbound.writableLength >= this.outbound.writableHighWaterMark
 		);
@@ -524,17 +530,19 @@ export class GatewaySession {
 			return;
 		}
 		this.clientPaused = true;
+		this.stats.recordPause();
+		pauseTotal.inc({ provider: this.providerId, reason });
 		try {
 			this.client.pause();
 		} catch {
 			// ignore
 		}
-		const bufferedBytes = this.bufferedBytes + this.upstreamBuffered();
+		const bufferedBytes = this.bufferedBytes + this.providerBuffered();
 		this.sendClientEvent({
 			type: "gateway.pause",
 			reason,
 			bufferedBytes,
-			highWaterMark: this.config.HIGH_WATER_MARK,
+			highWaterMark: this.highWaterMark,
 		});
 		this.sendClientEvent({
 			type: "gateway.backpressure",
@@ -557,52 +565,24 @@ export class GatewaySession {
 			return;
 		}
 		this.clientPaused = false;
-		this.bufferedBytes = this.upstreamBuffered();
+		this.bufferedBytes = this.providerBuffered();
 		try {
 			this.client.resume();
 		} catch {
 			// ignore
 		}
-		const bufferedBytes = this.bufferedBytes;
 		this.sendClientEvent({
 			type: "gateway.resume",
 			reason,
-			bufferedBytes,
+			bufferedBytes: this.bufferedBytes,
 		});
 		this.sendClientEvent({
 			type: "gateway.backpressure",
 			paused: false,
 			reason,
-			bufferedBytes,
+			bufferedBytes: this.bufferedBytes,
 		});
 		this.log("info", `[${this.sessionId}] resume client (${reason})`);
-	}
-
-	private sendUpstreamJson(payload: Record<string, unknown>): boolean {
-		if (!this.upstream || this.upstream.readyState !== WebSocket.OPEN) {
-			return false;
-		}
-		return this.sendUpstreamRaw(this.upstream, JSON.stringify(payload));
-	}
-
-	private sendUpstreamRaw(upstream: WebSocket, payload: string): boolean {
-		if (upstream.readyState !== WebSocket.OPEN) {
-			return false;
-		}
-		const bytes = Buffer.byteLength(payload, "utf8");
-		this.bufferedBytes += bytes;
-		upstream.send(payload, (err) => {
-			if (err) {
-				this.log("error", `[${this.sessionId}] upstream send failed: ${err.message}`);
-			} else {
-				this.bufferedBytes = Math.max(0, this.bufferedBytes - bytes);
-				this.evaluateBackpressure("send_ack");
-			}
-		});
-		if (upstream.bufferedAmount >= this.config.HIGH_WATER_MARK) {
-			this.pauseClient("upstream_bufferedAmount");
-		}
-		return true;
 	}
 
 	private sendClientEvent(event: Record<string, unknown>): void {
@@ -610,7 +590,7 @@ export class GatewaySession {
 	}
 
 	private sendClientText(text: string): void {
-		if (this.client.readyState !== WebSocket.OPEN) {
+		if (this.client.readyState !== 1 /* OPEN */) {
 			return;
 		}
 		try {
@@ -622,7 +602,7 @@ export class GatewaySession {
 	}
 
 	private sendClientBinary(data: Buffer): void {
-		if (this.client.readyState !== WebSocket.OPEN) {
+		if (this.client.readyState !== 1) {
 			return;
 		}
 		try {
@@ -633,13 +613,13 @@ export class GatewaySession {
 		}
 	}
 
-	private safeClose(socket: WebSocket, code: number, reason: string): void {
-		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+	private safeCloseClient(code: number, reason: string): void {
+		if (this.client.readyState === 0 || this.client.readyState === 1) {
 			try {
-				socket.close(code, reason.slice(0, 123));
+				this.client.close(code, reason.slice(0, 123));
 			} catch {
 				try {
-					socket.terminate();
+					this.client.terminate();
 				} catch {
 					// ignore
 				}

@@ -1,0 +1,104 @@
+{
+	"annotations": {
+		"list": [
+			{
+				"builtIn": 1,
+				"datasource": { "type": "grafana", "uid": "-- Grafana --" },
+				"enable": true,
+				"hide": true,
+				"iconColor": "rgba(0, 211, 255, 1)",
+				"name": "Annotations & Alerts",
+				"type": "dashboard"
+			}
+		]
+	},
+	"editable": true,
+	"fiscalYearStartMonth": 0,
+	"graphTooltip": 0,
+	"id": null,
+	"links": [],
+	"panels": [
+		{
+			"datasource": { "type": "prometheus", "uid": "prometheus" },
+			"fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+			"gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+			"id": 1,
+			"title": "Active sessions",
+			"type": "timeseries",
+			"targets": [
+				{
+					"expr": "audio_gateway_sessions_active",
+					"legendFormat": "sessions",
+					"refId": "A"
+				}
+			]
+		},
+		{
+			"datasource": { "type": "prometheus", "uid": "prometheus" },
+			"fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+			"gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+			"id": 2,
+			"title": "Speech frames / sec",
+			"type": "timeseries",
+			"targets": [
+				{
+					"expr": "rate(audio_gateway_speech_frames_total[1m])",
+					"legendFormat": "{{provider}}",
+					"refId": "A"
+				}
+			]
+		},
+		{
+			"datasource": { "type": "prometheus", "uid": "prometheus" },
+			"fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+			"gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+			"id": 3,
+			"title": "RTT p95",
+			"type": "timeseries",
+			"targets": [
+				{
+					"expr": "histogram_quantile(0.95, sum(rate(audio_gateway_rtt_ms_bucket[5m])) by (le, provider))",
+					"legendFormat": "{{provider}}",
+					"refId": "A"
+				}
+			]
+		},
+		{
+			"datasource": { "type": "prometheus", "uid": "prometheus" },
+			"fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+			"gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+			"id": 4,
+			"title": "Buffer occupancy",
+			"type": "timeseries",
+			"targets": [
+				{
+					"expr": "audio_gateway_buffer_occupancy_bytes",
+					"legendFormat": "{{provider}}",
+					"refId": "A"
+				}
+			]
+		},
+		{
+			"datasource": { "type": "prometheus", "uid": "prometheus" },
+			"fieldConfig": { "defaults": {}, "overrides": [] },
+			"gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+			"id": 5,
+			"title": "VAD triggers / sec",
+			"type": "timeseries",
+			"targets": [
+				{
+					"expr": "rate(audio_gateway_vad_triggers_total[1m])",
+					"legendFormat": "{{provider}}",
+					"refId": "A"
+				}
+			]
+		}
+	],
+	"schemaVersion": 39,
+	"tags": ["audio-gateway", "prometheus"],
+	"templating": { "list": [] },
+	"time": { "from": "now-15m", "to": "now" },
+	"title": "Anthropic Audio Gateway",
+	"uid": "audio-gateway-v02",
+	"version": 1
+}
