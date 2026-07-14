@@ -1,3 +1,5 @@
+![60s proof: demo client → mock provider (connect → VAD speech → metrics)](docs/demo/demo-client.gif)
+
 # Anthropic Live-Audio Stream Gateway
 
 AGPL-3.0 real-time AI audio runtime: browser (or WebRTC-bridged) PCM/Opus → provider adapters (Anthropic, OpenAI, Gemini, Deepgram, Mock) with Zero-GC ring buffers, spectral-entropy VAD, Transform backpressure, Prometheus metrics, plugins, and adaptive streaming.
@@ -10,9 +12,9 @@ AGPL-3.0 real-time AI audio runtime: browser (or WebRTC-bridged) PCM/Opus → pr
 
 ## Demo
 
-![Demo client connected to mock provider](docs/demo/demo-client.svg)
+![Demo client connected to mock provider](docs/demo/demo-client.gif)
 
-Open [`examples/demo-client.html`](examples/demo-client.html) against a local gateway with `PROVIDER=mock`. Details: [docs/demo/README.md](docs/demo/README.md).
+Open [`examples/demo-client.html`](examples/demo-client.html) against a local gateway with `PROVIDER=mock`. Static storyboard: [docs/demo/demo-client.svg](docs/demo/demo-client.svg). Details: [docs/demo/README.md](docs/demo/README.md).
 
 ## Architecture
 
