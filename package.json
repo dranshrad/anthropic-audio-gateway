@@ -23,8 +23,8 @@
 		"format": "biome format --write .",
 		"check": "biome check .",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
-		"test": "PROVIDER=mock node --import tsx --test test/**/*.test.ts",
-		"test:watch": "PROVIDER=mock node --import tsx --test --watch test/**/*.test.ts",
+		"test": "PROVIDER=mock node --import tsx --test test/*.test.ts",
+		"test:watch": "PROVIDER=mock node --import tsx --test --watch test/*.test.ts",
 		"bench": "PROVIDER=mock tsx bench/load-mock.ts"
 	},
 	"keywords": ["anthropic", "websocket", "audio", "realtime", "gateway", "vad", "pcm", "opus"],
